@@ -6,19 +6,25 @@ contract the Android app already speaks (prelogin.php / setup.php / login.php /
 items.php / logout.php). The server only ever stores ciphertext, KDF parameters
 and bcrypt(auth_hash); it can never read a vault.
 
+Connections are opened fresh per request and closed immediately. Neon's -pooler
+endpoint does the real pooling, and this avoids the classic failure where a
+client-side pool hands out a connection that Neon already closed on scale-to-zero.
+
 Run (dev):   DATABASE_URL=... python app.py
-Run (prod):  gunicorn -b 0.0.0.0:$PORT app:app
+Run (prod):  gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
+import logging
 import secrets
 import hashlib
 import datetime
-from functools import wraps
 
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 import psycopg
-from psycopg_pool import ConnectionPool
 import bcrypt
+
+logging.basicConfig(level=logging.INFO)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 TOKEN_TTL_DAYS = 30
@@ -27,10 +33,14 @@ DEFAULT_ITER = 600000
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required (your Neon connection string).")
 
-# A small pool is friendly to Neon's pooler endpoint and to a 512 MB free dyno.
-pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, kwargs={"autocommit": True})
-
 app = Flask(__name__)
+
+
+def get_conn():
+    """A fresh autocommit connection. Caller uses it as a context manager so it
+    always closes — no long-lived pool to go stale when Neon suspends."""
+    return psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=15)
+
 
 # ---------------------------------------------------------------- schema
 
@@ -69,7 +79,7 @@ SCHEMA = [
 
 
 def init_db():
-    with pool.connection() as conn:
+    with get_conn() as conn:
         for stmt in SCHEMA:
             conn.execute(stmt)
 
@@ -101,6 +111,16 @@ def cors(resp):
     return resp
 
 
+@app.errorhandler(Exception)
+def on_error(e):
+    # Let Flask handle normal HTTP errors (404/405/…); log everything else so a
+    # 500 shows its real traceback in the host logs and the client still gets JSON.
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("Unhandled error")
+    return jsonify({"error": "server_error"}), 500
+
+
 def require_auth():
     """Return user_id for a valid Bearer token, or None."""
     hdr = request.headers.get("Authorization", "")
@@ -109,22 +129,12 @@ def require_auth():
     token = hdr[7:].strip()
     if not token:
         return None
-    with pool.connection() as conn:
+    with get_conn() as conn:
         row = conn.execute(
             "SELECT user_id FROM api_tokens WHERE token = %s AND expires_at > (now() AT TIME ZONE 'utc')",
             (token,),
         ).fetchone()
     return row[0] if row else None
-
-
-def auth_required(fn):
-    @wraps(fn)
-    def wrapper(*a, **kw):
-        uid = require_auth()
-        if uid is None:
-            return err("invalid_token", 401)
-        return fn(uid, *a, **kw)
-    return wrapper
 
 
 # ---------------------------------------------------------------- endpoints
@@ -136,7 +146,7 @@ def prelogin():
     email = (request.args.get("email") or "").strip().lower()
     if not email:
         return err("email_required")
-    with pool.connection() as conn:
+    with get_conn() as conn:
         row = conn.execute(
             """SELECT v.kdf_salt, v.kdf_iter
                FROM accounts a LEFT JOIN vault_accounts v ON v.user_id = a.id
@@ -175,15 +185,13 @@ def setup():
         return err("kdf_iter_too_low")
 
     ah = bcrypt.hashpw(auth_hash.encode(), bcrypt.gensalt()).decode()
-    with pool.connection() as conn:
-        # Create the account if it's new.
+    with get_conn() as conn:
         uid = conn.execute(
             """INSERT INTO accounts (email) VALUES (%s)
                ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
                RETURNING id""",
             (email,),
         ).fetchone()[0]
-        # Refuse to clobber an already-enrolled vault (would orphan existing data).
         exists = conn.execute(
             "SELECT 1 FROM vault_accounts WHERE user_id = %s", (uid,)
         ).fetchone()
@@ -207,7 +215,7 @@ def login():
     if not email or not auth_hash:
         return err("missing_fields")
 
-    with pool.connection() as conn:
+    with get_conn() as conn:
         row = conn.execute(
             """SELECT a.id, v.auth_hash, v.kdf_salt, v.kdf_iter, v.protected_key
                FROM accounts a JOIN vault_accounts v ON v.user_id = a.id
@@ -242,7 +250,7 @@ def items():
 
     if request.method == "GET":
         since = (request.args.get("since") or "").strip()
-        with pool.connection() as conn:
+        with get_conn() as conn:
             if since:
                 rows = conn.execute(
                     """SELECT item_uuid, ciphertext, deleted,
@@ -271,7 +279,7 @@ def items():
     if request.method == "POST":
         d = request.get_json(silent=True) or {}
         incoming = d.get("items") or []
-        with pool.connection() as conn:
+        with get_conn() as conn:
             for it in incoming:
                 uuid = str(it.get("uuid") or "")
                 ct = str(it.get("ciphertext") or "")
@@ -295,7 +303,7 @@ def items():
     uuid = str(d.get("uuid") or "")
     if not uuid:
         return err("missing_fields")
-    with pool.connection() as conn:
+    with get_conn() as conn:
         conn.execute(
             """UPDATE vault_items SET deleted = 1, updated_at = (now() AT TIME ZONE 'utc')
                WHERE user_id = %s AND item_uuid = %s""",
@@ -313,7 +321,7 @@ def logout():
         return err("invalid_token", 401)
     hdr = request.headers.get("Authorization", "")
     token = hdr[7:].strip()
-    with pool.connection() as conn:
+    with get_conn() as conn:
         conn.execute("DELETE FROM api_tokens WHERE token = %s", (token,))
     return jsonify({"success": True})
 
@@ -326,11 +334,8 @@ def health():
 def start_self_ping():
     """Keep a free Render instance from spinning down by pinging our own public URL.
     Render injects RENDER_EXTERNAL_URL automatically; or set SELF_PING_URL yourself.
-    Default every 10 min (Render sleeps after ~15 min idle). A background daemon thread.
-    NOTE: this only keeps an *already-awake* instance warm — it can't wake one that has
-    fully slept (e.g. after a deploy/crash). For that, also add an external monitor
-    (UptimeRobot / cron-job.org) hitting the URL.
-    """
+    Only keeps an *already-awake* instance warm; pair with an external monitor
+    (UptimeRobot / cron-job.org) to wake one that fully slept."""
     base = os.environ.get("SELF_PING_URL") or os.environ.get("RENDER_EXTERNAL_URL")
     if not base:
         return
@@ -351,8 +356,13 @@ def start_self_ping():
     threading.Thread(target=loop, daemon=True).start()
 
 
-# Create tables on startup (idempotent), then start the keep-warm pinger.
-init_db()
+# Create tables on startup (idempotent). Don't crash the worker if Neon is briefly
+# unreachable at boot — the schema already exists and per-request connects will retry.
+try:
+    init_db()
+except Exception:
+    app.logger.exception("init_db failed at startup (continuing; schema likely exists)")
+
 start_self_ping()
 
 if __name__ == "__main__":
