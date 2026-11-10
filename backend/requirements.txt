@@ -1,5 +1,7 @@
-Flask==3.0.3
-psycopg[binary]==3.2.3
-psycopg-pool==3.2.3
-bcrypt==4.2.0
-gunicorn==23.0.0
+# Loose lower-bound pins so pip resolves wheels on whatever Python the host runs
+# (Render's image only ships psycopg-binary >= 3.2.10).
+Flask>=3.0,<4
+gunicorn>=22.0
+bcrypt>=4.1
+psycopg[binary]>=3.2.10
+psycopg-pool>=3.2
